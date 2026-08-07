@@ -15,8 +15,11 @@ function getDistanceMeters(lat1, lng1, lat2, lng2) {
 // searches with) and a trip's actual departureTime (a full Date) — compares
 // time-of-day only, ignoring the calendar date.
 function getTimeDiffMinutes(hhmm, departureDate) {
+  if (!hhmm || !departureDate) return 0;
   const [h1, m1] = hhmm.split(':').map(Number);
-  const tripMinutes = departureDate.getUTCHours() * 60 + departureDate.getUTCMinutes();
+  const d = new Date(departureDate);
+  if (isNaN(d.getTime())) return 0;
+  const tripMinutes = d.getUTCHours() * 60 + d.getUTCMinutes();
   return Math.abs(h1 * 60 + m1 - tripMinutes);
 }
 

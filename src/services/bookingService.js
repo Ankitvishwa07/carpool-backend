@@ -54,61 +54,82 @@ async function createRequest({ tripId, riderId, seatsRequested = 1, matchMeta, p
   return request;
 }
 
-async function acceptRequest({ requestId, driverId }) {
-  const session = await mongoose.startSession();
+async function executeWithTransactionFallback(operation) {
+  let session;
   try {
-    let updatedRequest;
-
-    await session.withTransaction(async () => {
-      const request = await RideRequest.findById(requestId).session(session);
-      if (!request) throw new BookingError('Request not found', 404);
-      if (request.status !== 'pending') {
-        throw new BookingError(`Request is already ${request.status}`, 409);
+    session = await mongoose.startSession();
+    let result;
+    try {
+      await session.withTransaction(async () => {
+        result = await operation(session);
+      });
+      return result;
+    } catch (err) {
+      if (err.message && (err.message.includes('Transaction numbers') || err.message.includes('standalone'))) {
+        return await operation(null);
       }
-
-      const trip = await Trip.findById(request.tripId).session(session);
-      if (!trip) throw new BookingError('Trip not found', 404);
-      if (String(trip.driverId) !== String(driverId)) {
-        throw new BookingError('Only the driver can accept requests on this trip', 403);
-      }
-      if (trip.status !== 'active') {
-        throw new BookingError('Trip is no longer accepting riders', 409);
-      }
-
-      const seatsRemaining = trip.seatsTotal - trip.seatsBooked;
-      if (seatsRemaining < request.seatsRequested) {
-        throw new BookingError('Not enough seats remaining to accept this request', 409);
-      }
-
-      trip.seatsBooked += request.seatsRequested;
-      if (trip.seatsBooked >= trip.seatsTotal) {
-        trip.status = 'full';
-      }
-      await trip.save({ session });
-
-      request.status = 'accepted';
-      request.respondedAt = new Date();
-      await request.save({ session });
-
-      updatedRequest = request;
-    });
-
-    // notify AFTER the transaction commits — never notify on a state change
-    // that might still get rolled back
-    await notify({
-      recipientId: updatedRequest.riderId,
-      type: 'request_accepted',
-      title: 'Ride request accepted',
-      body: 'Your ride request was accepted by the driver',
-      tripId: updatedRequest.tripId,
-      requestId: updatedRequest._id,
-      actorId: driverId,
-    });
-
-    return updatedRequest;
-  } finally {
-    await session.endSession();
+      throw err;
+    } finally {
+      await session.endSession();
+    }
+  } catch (err) {
+    if (err.message && (err.message.includes('Transaction numbers') || err.message.includes('standalone'))) {
+      return await operation(null);
+    }
+    throw err;
   }
+}
+
+async function acceptRequest({ requestId, driverId }) {
+  let updatedRequest;
+
+  await executeWithTransactionFallback(async (session) => {
+    const findReq = RideRequest.findById(requestId);
+    const request = session ? await findReq.session(session) : await findReq;
+    if (!request) throw new BookingError('Request not found', 404);
+    if (request.status !== 'pending') {
+      throw new BookingError(`Request is already ${request.status}`, 409);
+    }
+
+    const findTrip = Trip.findById(request.tripId);
+    const trip = session ? await findTrip.session(session) : await findTrip;
+    if (!trip) throw new BookingError('Trip not found', 404);
+    if (String(trip.driverId) !== String(driverId)) {
+      throw new BookingError('Only the driver can accept requests on this trip', 403);
+    }
+    if (trip.status !== 'active') {
+      throw new BookingError('Trip is no longer accepting riders', 409);
+    }
+
+    const seatsRemaining = trip.seatsTotal - trip.seatsBooked;
+    if (seatsRemaining < request.seatsRequested) {
+      throw new BookingError('Not enough seats remaining to accept this request', 409);
+    }
+
+    trip.seatsBooked += request.seatsRequested;
+    if (trip.seatsBooked >= trip.seatsTotal) {
+      trip.status = 'full';
+    }
+    await trip.save(session ? { session } : {});
+
+    request.status = 'accepted';
+    request.respondedAt = new Date();
+    await request.save(session ? { session } : {});
+
+    updatedRequest = request;
+  });
+
+  await notify({
+    recipientId: updatedRequest.riderId,
+    type: 'request_accepted',
+    title: 'Ride request accepted',
+    body: 'Your ride request was accepted by the driver',
+    tripId: updatedRequest.tripId,
+    requestId: updatedRequest._id,
+    actorId: driverId,
+  });
+
+  return updatedRequest;
 }
 
 async function declineRequest({ requestId, driverId }) {
@@ -141,59 +162,56 @@ async function declineRequest({ requestId, driverId }) {
 }
 
 async function cancelRequest({ requestId, userId }) {
-  const session = await mongoose.startSession();
-  try {
-    let updatedRequest;
-    let driverIdToNotify = null;
+  let updatedRequest;
+  let driverIdToNotify = null;
 
-    await session.withTransaction(async () => {
-      const request = await RideRequest.findById(requestId).session(session);
-      if (!request) throw new BookingError('Request not found', 404);
-      if (String(request.riderId) !== String(userId)) {
-        throw new BookingError('Only the rider can cancel their own request', 403);
-      }
-      if (!['pending', 'accepted'].includes(request.status)) {
-        throw new BookingError(`Request is already ${request.status}`, 409);
-      }
-
-      const wasAccepted = request.status === 'accepted';
-
-      request.status = 'cancelled';
-      request.respondedAt = new Date();
-      request.cancelledBy = userId;
-      await request.save({ session });
-
-      if (wasAccepted) {
-        const trip = await Trip.findById(request.tripId).session(session);
-        if (trip) {
-          trip.seatsBooked = Math.max(0, trip.seatsBooked - request.seatsRequested);
-          if (trip.status === 'full' && trip.seatsBooked < trip.seatsTotal) {
-            trip.status = 'active';
-          }
-          await trip.save({ session });
-          driverIdToNotify = trip.driverId;
-        }
-      }
-
-      updatedRequest = request;
-    });
-
-    if (driverIdToNotify) {
-      await notify({
-        recipientId: driverIdToNotify,
-        type: 'request_cancelled',
-        title: 'Rider cancelled',
-        body: 'A rider cancelled their accepted seat on your trip',
-        tripId: updatedRequest.tripId,
-        requestId: updatedRequest._id,
-        actorId: userId,
-      });
+  await executeWithTransactionFallback(async (session) => {
+    const findReq = RideRequest.findById(requestId);
+    const request = session ? await findReq.session(session) : await findReq;
+    if (!request) throw new BookingError('Request not found', 404);
+    if (String(request.riderId) !== String(userId)) {
+      throw new BookingError('Only the rider can cancel their own request', 403);
+    }
+    if (!['pending', 'accepted'].includes(request.status)) {
+      throw new BookingError(`Request is already ${request.status}`, 409);
     }
 
-    return updatedRequest;
-  } finally {
-    await session.endSession();
+    const wasAccepted = request.status === 'accepted';
+
+    request.status = 'cancelled';
+    request.respondedAt = new Date();
+    request.cancelledBy = userId;
+    await request.save(session ? { session } : {});
+
+    if (wasAccepted) {
+      const findTrip = Trip.findById(request.tripId);
+      const trip = session ? await findTrip.session(session) : await findTrip;
+      if (trip) {
+        trip.seatsBooked = Math.max(0, trip.seatsBooked - request.seatsRequested);
+        if (trip.status === 'full' && trip.seatsBooked < trip.seatsTotal) {
+          trip.status = 'active';
+        }
+        await trip.save(session ? { session } : {});
+        driverIdToNotify = trip.driverId;
+      }
+    }
+
+    updatedRequest = request;
+  });
+
+  if (driverIdToNotify) {
+    await notify({
+      recipientId: driverIdToNotify,
+      type: 'request_cancelled',
+      title: 'Rider cancelled',
+      body: 'A rider cancelled their accepted seat on your trip',
+      tripId: updatedRequest.tripId,
+      requestId: updatedRequest._id,
+      actorId: userId,
+    });
   }
+
+  return updatedRequest;
 }
 
 module.exports = {

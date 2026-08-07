@@ -21,14 +21,18 @@ async function findMatches({
   riderPickup, // optional [lng, lat] — defaults to origin if omitted
   riderDropoff, // optional [lng, lat] — defaults to destination if omitted
 }) {
-  const radiusMeters = radiusKm * 1000;
+  const numOriginLat = parseFloat(originLat);
+  const numOriginLng = parseFloat(originLng);
+  const numDestLat = parseFloat(destLat);
+  const numDestLng = parseFloat(destLng);
+  const radiusMeters = Number(radiusKm) * 1000;
 
   // Step 1: geo filter (DB-level, uses 2dsphere index)
   const candidates = await Trip.find({
     status: 'active',
     origin: {
       $near: {
-        $geometry: { type: 'Point', coordinates: [originLng, originLat] },
+        $geometry: { type: 'Point', coordinates: [numOriginLng, numOriginLat] },
         $maxDistance: radiusMeters,
       },
     },
